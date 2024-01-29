@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import '../XSD/XSDStablecoin.sol';
+import "../XSD/XSDStablecoin.sol";
 import "../UniswapFork/BankXLibrary.sol";
-import "../XSD/Pools/CollateralPool.sol";
+import "../XSD/Pools/Interfaces/ICollateralPool.sol";
 import "../XSD/Pools/Interfaces/IBankXWETHpool.sol";
 import "../XSD/Pools/Interfaces/IXSDWETHpool.sol";
 import "../Utils/Initializable.sol";
@@ -16,9 +16,8 @@ contract PIDController is Initializable {
     // Instances
     XSDStablecoin public XSD;
     BankXToken public BankX;
-    CollateralPool public collateralpool;
-
-
+    ICollateralPool public collateralpool;
+    
     // XSD and BankX addresses
     address public xsdwethpool_address;
     address public bankxwethpool_address;
@@ -45,11 +44,12 @@ contract PIDController is Initializable {
     bool public use_growth_ratio;
     bool public collateral_ratio_paused;
     bool public FIP_6;
+    
+    //deficit related variables
     bool public bucket1;
     bool public bucket2;
     bool public bucket3;
-    
-    //deficit related variables
+
     uint public diff1;
     uint public diff2;
     uint public diff3;
@@ -64,14 +64,18 @@ contract PIDController is Initializable {
 
     //arbitrage relate variables
     uint256 public xsd_percent;
-    uint256 public xsd_burnable_limit;
-    uint256 public maxArbBurnAbove;
-    uint256 public minArbBurnBelow;
-
     uint256 public xsd_percentage_target;
     uint256 public bankx_percentage_target;
     uint256 public cd_allocated_supply;
 
+    //price variables
+    uint256 public bankx_updated_price;
+    uint256 public xsd_updated_price;
+    struct PriceCheck{
+        uint256 lastpricecheck;
+        bool pricecheck;
+    }
+    mapping (address => PriceCheck) public lastPriceCheck;
     /* ========== MODIFIERS ========== */
 
     modifier onlyByOwner() {
@@ -80,8 +84,8 @@ contract PIDController is Initializable {
     }
 
     /* ========== CONSTRUCTOR ========== */
-
-    function initialize(address _xsd_contract_address,address _bankx_contract_address,address _xsd_weth_pool_address, address _bankx_weth_pool_address,address payable _collateralpool_contract_address,address _WETHaddress,address _smartcontract_owner,address _reward_manager_address, uint _xsd_percentage_target, uint _bankx_percentage_target) public initializer{
+//switch back to constructor
+    function initialize(address _xsd_contract_address,address _bankx_contract_address,address _xsd_weth_pool_address, address _bankx_weth_pool_address,address _collateralpool_contract_address,address _WETHaddress,address _smartcontract_owner,address _reward_manager_address, uint _xsd_percentage_target, uint _bankx_percentage_target) public initializer{
         require(
             (_xsd_contract_address != address(0))
             && (_bankx_contract_address != address(0))
@@ -97,7 +101,7 @@ contract PIDController is Initializable {
         reward_manager_address = _reward_manager_address;
         xsd_step = 2500;
         collateralpool_address = _collateralpool_contract_address;
-        collateralpool = CollateralPool(_collateralpool_contract_address);
+        collateralpool = ICollateralPool(_collateralpool_contract_address);
         XSD = XSDStablecoin(_xsd_contract_address);
         BankX = BankXToken(_bankx_contract_address);
         WETH = _WETHaddress;
@@ -115,6 +119,7 @@ contract PIDController is Initializable {
     //interest rate variable
     /* ========== PUBLIC MUTATIVE FUNCTIONS ========== */
     
+    //add a smaller function price check
     function systemCalculations() public {
     	require(collateral_ratio_paused == false, "Collateral Ratio has been paused");
         uint256 time_elapsed = block.timestamp - last_update;
@@ -136,14 +141,14 @@ contract PIDController is Initializable {
         uint256 silver_price = (XSD.xag_usd_price()*(1e4))/(311035); //31.1034768
         uint256 XSD_top_band = silver_price + (xsd_percent*silver_price)/100;
         uint256 XSD_bottom_band = silver_price - (xsd_percent*silver_price)/100;
-        xsd_burnable_limit = approximateXSD();
+        
         // make the top band and bottom band a percentage of silver price.
 
         if(FIP_6){
             require(xsd_price > XSD_top_band || xsd_price < XSD_bottom_band, "Use PIDController when XSD is outside of peg");
         }
 
-        if((NFT_timestamp == 0) || ((block.timestamp - NFT_timestamp)>43200)){
+       if((NFT_timestamp == 0) || ((block.timestamp - NFT_timestamp)>43200)){
             BankXInterface(BankXNFT_address).updateTVLReached();
             NFT_timestamp = block.timestamp;
         }
@@ -151,10 +156,10 @@ contract PIDController is Initializable {
         // First, check if the price is out of the band
         if(xsd_price > XSD_top_band){
             new_collateral_ratio = last_collateral_ratio - xsd_step;
-            maxArbBurnAbove = aboveThePeg();
+            
         } else if (xsd_price < XSD_bottom_band){
             new_collateral_ratio = last_collateral_ratio + xsd_step;
-            minArbBurnBelow = belowThePeg();
+            
 
         // Else, check if the growth ratio has increased or decreased since last update
         } else if(use_growth_ratio){
@@ -176,6 +181,7 @@ contract PIDController is Initializable {
         incentiveChecker1();
         incentiveChecker2();
         incentiveChecker3();
+        priceCheck();
         if(is_active){
             uint256 delta_collateral_ratio;
             if(new_collateral_ratio > last_collateral_ratio){
@@ -200,6 +206,13 @@ contract PIDController is Initializable {
             //change price target to that of one ounce/gram of silver.
             XSD.setPriceTarget((XSD.xag_usd_price()*(1e4))/(311035));           
         }
+    }
+
+    function priceCheck() public {
+        bankx_updated_price = XSD.bankx_price();
+        xsd_updated_price = XSD.xsd_price();
+        lastPriceCheck[msg.sender].lastpricecheck = block.number;
+        lastPriceCheck[msg.sender].pricecheck = true;
     }
 
     //checks the XSD liquidity pool for a deficit.
@@ -271,42 +284,6 @@ contract PIDController is Initializable {
         }
     }
 
-    //Essentially the value of both halves of the pool have to be the same:
-    // XSD number * XSD USD price = ETH reserves * ETH USD Price
-    // target XSD number = ETH reserves * ETH USD Price/ silver price
-
-    function approximateXSD() internal view returns(uint256 xsd_amount){
-        (uint reserveA, uint reserveB,) = IXSDWETHpool(xsdwethpool_address).getReserves();
-        uint silver_price = (XSD.xag_usd_price()*(1e4))/(311035);
-        uint x = reserveB * XSD.eth_usd_price(); // precision of 1e6
-        uint target = x/silver_price; //number of xsd we need
-        if(target>reserveA)
-            xsd_amount = target - reserveA;
-        else
-            xsd_amount = reserveA - target;
-}
-//burning BankX for XSD
-//sol gives the maxXSD that can be minted
-function aboveThePeg() internal view returns(uint256 sol){
-    uint silver_price = (XSD.xag_usd_price()*(1e4))/(311035);
-    (uint reserveA, uint reserveB,) = IXSDWETHpool(xsdwethpool_address).getReserves();
-    sol = ((XSD.xsd_price()*XSD.eth_usd_price()*reserveB) - (reserveA*XSD.xsd_price()*silver_price))/((silver_price+XSD.xsd_price())*silver_price);
-    if( sol > xsd_burnable_limit){
-        sol = xsd_burnable_limit;
-    }
-}
-
-//burning XSD for BankX
-// sol gives the maxXSD that can be burnt
-function belowThePeg() internal view returns(uint256 sol){
-    uint silver_price = (XSD.xag_usd_price()*(1e4))/(311035);
-    (uint reserveA, uint reserveB,) = IXSDWETHpool(xsdwethpool_address).getReserves();
-    sol = ((reserveA*XSD.xsd_price()*silver_price)-(XSD.xsd_price()*XSD.eth_usd_price()*reserveB))/((silver_price+XSD.xsd_price())*silver_price);
-    if( sol > xsd_burnable_limit){
-        sol = xsd_burnable_limit;
-    }
-}
-
     //functions to change amountpaid variables
     function amountPaidXSDWETH(uint ethvalue) external {
         require(msg.sender == reward_manager_address, "Only RewardManager can access this address");
@@ -362,7 +339,7 @@ function belowThePeg() internal view returns(uint256 sol){
 
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
     }
 
@@ -385,7 +362,7 @@ function belowThePeg() internal view returns(uint256 sol){
 
     function setCollateralPoolAddress(address payable _collateralpool_contract_address) external onlyByOwner{
         collateralpool_address = _collateralpool_contract_address;
-        collateralpool = CollateralPool(_collateralpool_contract_address);
+        collateralpool = ICollateralPool(_collateralpool_contract_address);
     }
 
     function setXSDAddress(address _xsd_contract_address) external onlyByOwner{

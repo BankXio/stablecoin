@@ -46,7 +46,7 @@ import "../XSDStablecoin.sol";
 import "./Interfaces/IBankXWETHpool.sol";
 import "./Interfaces/IXSDWETHpool.sol";
 import '../../Oracle/Interfaces/IPIDController.sol';
-import "../../ERC20/IWETH.sol";
+import "../../BEP20/IWBNB.sol";
 import "./CollateralPoolLibrary.sol";
 
 contract CollateralPool is ReentrancyGuard {
@@ -63,21 +63,14 @@ contract CollateralPool is ReentrancyGuard {
     XSDStablecoin private XSD;
     IPIDController private pid_controller;
     uint256 public collat_XSD;
-    uint256 public bankx_price;
-    uint256 public xsd_price;
     bool public mint_paused;
     bool public redeem_paused;
     bool public buyback_paused;
-
     struct MintInfo {
         uint256 accum_interest; //accumulated interest from previous mints
         uint256 interest_rate; //interest rate at that particular timestamp
         uint256 time; //last timestamp
         uint256 amount; //XSD amount minted
-    }
-    struct PriceCheck{
-        uint256 lastpricecheck;
-        bool pricecheck;
     }
     mapping(address=>MintInfo) public mintMapping; 
     mapping (address => uint256) public redeemBankXBalances;
@@ -88,10 +81,12 @@ contract CollateralPool is ReentrancyGuard {
     uint256 public collateral_equivalent_d18;
     uint256 public bankx_minted_count;
     mapping (address => uint256) public lastRedeemed;
-    mapping (address => PriceCheck) public lastPriceCheck;
-
     uint256 public block_delay = 2;
     /* ========== MODIFIERS ========== */
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'BankXRouter: EXPIRED');
+        _;
+    }
 
     modifier onlyByOwner() {
         require(msg.sender == smartcontract_owner, "Not owner");
@@ -134,7 +129,7 @@ contract CollateralPool is ReentrancyGuard {
 
     // Returns dollar value of collateral held in this XSD pool
     function collatDollarBalance() public view returns (uint256) {
-            return ((IWETH(WETH).balanceOf(address(this))*XSD.eth_usd_price())/(1e6));        
+            return ((IWBNB(WETH).balanceOf(address(this))*XSD.eth_usd_price())/(1e6));        
     }
 
     // Returns the value of excess collateral held in this XSD pool, compared to what is needed to maintain the global collateral ratio
@@ -148,12 +143,7 @@ contract CollateralPool is ReentrancyGuard {
         else return 0;
     }
     /* ========== INTERNAL FUNCTIONS ======== */
-    function priceCheck() external{
-        bankx_price = XSD.bankx_price();
-        xsd_price = XSD.xsd_price();
-        lastPriceCheck[msg.sender].lastpricecheck = block.number;
-        lastPriceCheck[msg.sender].pricecheck = true;
-    }
+    //call the price check function again after check.
 
     function mintInterestCalc(uint xsd_amount,address sender) internal {
         (mintMapping[sender].accum_interest, mintMapping[sender].interest_rate, mintMapping[sender].time, mintMapping[sender].amount) = CollateralPoolLibrary.calcMintInterest(xsd_amount,XSD.xag_usd_price(), XSD.interest_rate(), mintMapping[sender].accum_interest, mintMapping[sender].interest_rate, mintMapping[sender].time, mintMapping[sender].amount);
@@ -165,7 +155,7 @@ contract CollateralPool is ReentrancyGuard {
     /* ========== PUBLIC FUNCTIONS ========== */
     
     // We separate out the 1t1, fractional and algorithmic minting functions for gas efficiency 
-    function mint1t1XSD(uint256 XSD_out_min) external payable nonReentrant {
+    function mint1t1XSD(uint256 XSD_out_min, uint256 deadline) external ensure(deadline) payable nonReentrant {
         require(!mint_paused, "Mint Paused");
         require(msg.value>0, "Invalid collateral amount");
         require(XSD.global_collateral_ratio() >= (1e6), "Collateral ratio must be >= 1");
@@ -176,20 +166,20 @@ contract CollateralPool is ReentrancyGuard {
         ); //1 XSD for each $1 worth of collateral
         require(XSD_out_min <= xsd_amount_d18, "Slippage limit reached");
         mintInterestCalc(xsd_amount_d18,msg.sender);
-        IWETH(WETH).deposit{value: msg.value}();
-        assert(IWETH(WETH).transfer(address(this), msg.value));
+        IWBNB(WETH).deposit{value: msg.value}();
+        assert(IWBNB(WETH).transfer(address(this), msg.value));
         collat_XSD = collat_XSD + xsd_amount_d18;
         XSD.pool_mint(msg.sender, xsd_amount_d18);
     }
 
     // 0% collateral-backed
-    function mintAlgorithmicXSD(uint256 bankx_amount_d18, uint256 XSD_out_min) external nonReentrant {
+    function mintAlgorithmicXSD(uint256 bankx_amount_d18, uint256 XSD_out_min, uint256 deadline) external ensure(deadline) nonReentrant {
         require(!mint_paused, "Mint Paused");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before minting");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before minting");
         uint256 xag_usd_price = XSD.xag_usd_price();
         require(XSD.global_collateral_ratio() == 0, "Collateral ratio must be 0");
         (uint256 xsd_amount_d18) = CollateralPoolLibrary.calcMintAlgorithmicXSD(
-            bankx_price, 
+            pid_controller.bankx_updated_price(), 
             xag_usd_price,
             bankx_amount_d18
         );
@@ -197,22 +187,22 @@ contract CollateralPool is ReentrancyGuard {
         mintInterestCalc(xsd_amount_d18,msg.sender);
         collat_XSD = collat_XSD + xsd_amount_d18;
         bankx_minted_count = bankx_minted_count + bankx_amount_d18;
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         BankX.pool_burn_from(msg.sender, bankx_amount_d18);
         XSD.pool_mint(msg.sender, xsd_amount_d18);
     }
 
     // Will fail if fully collateralized or fully algorithmic
     // > 0% and < 100% collateral-backed
-    function mintFractionalXSD(uint256 bankx_amount, uint256 XSD_out_min) external payable nonReentrant {
+    function mintFractionalXSD(uint256 bankx_amount, uint256 XSD_out_min, uint256 deadline) external ensure(deadline) payable nonReentrant {
         require(!mint_paused, "Mint Paused");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before minting");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before minting");
         uint256 xag_usd_price = XSD.xag_usd_price();
         uint256 global_collateral_ratio = XSD.global_collateral_ratio();
 
         require(global_collateral_ratio < (1e6) && global_collateral_ratio > 0, "Collateral ratio needs to be between .000001 and .999999");
         CollateralPoolLibrary.MintFF_Params memory input_params = CollateralPoolLibrary.MintFF_Params(
-            bankx_price,
+            pid_controller.bankx_updated_price(), //XSD.bankx_price
             XSD.eth_usd_price(),
             bankx_amount,
             msg.value,
@@ -226,21 +216,20 @@ contract CollateralPool is ReentrancyGuard {
         mintInterestCalc(mint_amount,msg.sender);
         bankx_minted_count = bankx_minted_count + bankx_needed;
         BankX.pool_burn_from(msg.sender, bankx_needed);
-        IWETH(WETH).deposit{value: msg.value}();
-        assert(IWETH(WETH).transfer(address(this), msg.value));
+        IWBNB(WETH).deposit{value: msg.value}();
+        assert(IWBNB(WETH).transfer(address(this), msg.value));
         collat_XSD = collat_XSD + mint_amount;
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         XSD.pool_mint(msg.sender, mint_amount);
     }
 
     // Redeem collateral. 100% collateral-backed
-    function redeem1t1XSD(uint256 XSD_amount, uint256 COLLATERAL_out_min) external nonReentrant {
+    function redeem1t1XSD(uint256 XSD_amount, uint256 COLLATERAL_out_min, uint256 deadline) external ensure(deadline) nonReentrant {
         require(!pid_controller.bucket3(), "Cannot withdraw in times of deficit");
         require(!redeem_paused, "Redeem Paused");
         require(XSD.global_collateral_ratio() == (1e6), "Collateral ratio must be == 1");
         require(XSD_amount<=mintMapping[msg.sender].amount, "OVERREDEMPTION ERROR");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before redeeming");
-
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before redeeming");
         // convert xsd to $ and then to collateral value
         (uint256 XSD_dollar,uint256 collateral_needed) = CollateralPoolLibrary.calcRedeem1t1XSD(
             XSD.eth_usd_price(),
@@ -248,7 +237,7 @@ contract CollateralPool is ReentrancyGuard {
             XSD_amount
         );
         uint total_xsd_amount = mintMapping[msg.sender].amount;
-        require(collateral_needed <= (IWETH(WETH).balanceOf(address(this))-unclaimedPoolCollateral), "Not enough collateral in pool");
+        require(collateral_needed <= (IWBNB(WETH).balanceOf(address(this))-unclaimedPoolCollateral), "Not enough collateral in pool");
         require(COLLATERAL_out_min <= collateral_needed, "Slippage limit reached");
         redeemInterestCalc(XSD_amount, msg.sender);
         uint current_accum_interest = (XSD_amount*mintMapping[msg.sender].accum_interest)/total_xsd_amount;
@@ -257,19 +246,19 @@ contract CollateralPool is ReentrancyGuard {
         unclaimedPoolCollateral = unclaimedPoolCollateral+XSD_dollar;
         lastRedeemed[msg.sender] = block.number;
         unclaimedPoolBankX = (unclaimedPoolBankX+current_accum_interest);
-        uint256 bankx_amount = (current_accum_interest*1e6)/bankx_price;
+        uint256 bankx_amount = (current_accum_interest*1e6)/pid_controller.bankx_updated_price();
         collat_XSD -= XSD_amount;
         mintMapping[msg.sender].accum_interest = (mintMapping[msg.sender].accum_interest - current_accum_interest);
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         XSD.pool_burn_from(msg.sender, XSD_amount);
         BankX.pool_mint(address(this), bankx_amount);
     }
 
     // Will fail if fully collateralized or algorithmic
     // Redeem XSD for collateral and BankX. > 0% and < 100% collateral-backed
-    function redeemFractionalXSD(uint256 XSD_amount, uint256 BankX_out_min, uint256 COLLATERAL_out_min) external nonReentrant {
+    function redeemFractionalXSD(uint256 XSD_amount, uint256 BankX_out_min, uint256 COLLATERAL_out_min, uint256 deadline) external ensure(deadline) nonReentrant {
         require(!pid_controller.bucket3(), "Cannot withdraw in times of deficit");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before redeeming");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before redeeming");
         require(!redeem_paused, "Redeem Paused");
         require(XSD_amount<=mintMapping[msg.sender].amount, "OVERREDEMPTION ERROR");
         uint256 xag_usd_price = XSD.xag_usd_price();
@@ -280,7 +269,7 @@ contract CollateralPool is ReentrancyGuard {
 
         uint256 bankx_dollar_value_d18 = XSD_amount - ((XSD_amount*global_collateral_ratio)/(1e6));
         bankx_dollar_value_d18 = (bankx_dollar_value_d18*xag_usd_price)/(31103477);
-        uint256 bankx_amount = (bankx_dollar_value_d18*1e6)/bankx_price;
+        uint256 bankx_amount = (bankx_dollar_value_d18*1e6)/pid_controller.bankx_updated_price();
 
 
         uint256 collateral_dollar_value = (XSD_amount*global_collateral_ratio)/(1e6);
@@ -288,7 +277,7 @@ contract CollateralPool is ReentrancyGuard {
         uint256 collateral_amount = (collateral_dollar_value*1e6)/XSD.eth_usd_price();
 
 
-        require(collateral_amount <= (IWETH(WETH).balanceOf(address(this))-unclaimedPoolCollateral), "Not enough collateral in pool");
+        require(collateral_amount <= (IWBNB(WETH).balanceOf(address(this))-unclaimedPoolCollateral), "Not enough collateral in pool");
         require(COLLATERAL_out_min <= collateral_amount, "Slippage limit reached [collateral]");
         require(BankX_out_min <= bankx_amount, "Slippage limit reached [BankX]");
 
@@ -299,27 +288,27 @@ contract CollateralPool is ReentrancyGuard {
         redeemInterestCalc(XSD_amount, msg.sender);
         uint current_accum_interest = (XSD_amount*mintMapping[msg.sender].accum_interest)/total_xsd_amount;
         redeemBankXBalances[msg.sender] = redeemBankXBalances[msg.sender]+current_accum_interest;
-        bankx_amount = bankx_amount + ((current_accum_interest*1e6)/bankx_price);
+        bankx_amount = bankx_amount + ((current_accum_interest*1e6)/pid_controller.bankx_updated_price());
         mintMapping[msg.sender].accum_interest = mintMapping[msg.sender].accum_interest - current_accum_interest;
         redeemBankXBalances[msg.sender] = redeemBankXBalances[msg.sender]+bankx_dollar_value_d18;
         unclaimedPoolBankX = unclaimedPoolBankX+bankx_dollar_value_d18+current_accum_interest;
         collat_XSD -= XSD_amount;
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
     
         XSD.pool_burn_from(msg.sender, XSD_amount);
         BankX.pool_mint(address(this), bankx_amount);
     }
 
     // Redeem XSD for BankX. 0% collateral-backed
-    function redeemAlgorithmicXSD(uint256 XSD_amount, uint256 BankX_out_min) external nonReentrant {
+    function redeemAlgorithmicXSD(uint256 XSD_amount, uint256 BankX_out_min, uint256 deadline) external ensure(deadline) nonReentrant {
         require(!pid_controller.bucket3(), "Cannot withdraw in times of deficit");
         require(!redeem_paused, "Redeem Paused");
         require(XSD_amount<=mintMapping[msg.sender].amount, "OVERREDEMPTION ERROR");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before redeeming");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before redeeming");
         require(XSD.global_collateral_ratio() == 0, "Collateral ratio must be 0"); 
         uint256 bankx_dollar_value_d18 = (XSD_amount*XSD.xag_usd_price())/(31103477);
 
-        uint256 bankx_amount = (bankx_dollar_value_d18*1e6)/bankx_price;
+        uint256 bankx_amount = (bankx_dollar_value_d18*1e6)/pid_controller.bankx_updated_price();
         
         lastRedeemed[msg.sender] = block.number;
         uint total_xsd_amount = mintMapping[msg.sender].amount;
@@ -327,12 +316,12 @@ contract CollateralPool is ReentrancyGuard {
         redeemInterestCalc(XSD_amount, msg.sender);
         uint current_accum_interest = XSD_amount*mintMapping[msg.sender].accum_interest/total_xsd_amount; //precision of 6
         redeemBankXBalances[msg.sender] = (redeemBankXBalances[msg.sender]+current_accum_interest);
-        bankx_amount = bankx_amount + ((current_accum_interest*1e6)/bankx_price);
+        bankx_amount = bankx_amount + ((current_accum_interest*1e6)/pid_controller.bankx_updated_price());
         mintMapping[msg.sender].accum_interest = (mintMapping[msg.sender].accum_interest - current_accum_interest);
         redeemBankXBalances[msg.sender] = redeemBankXBalances[msg.sender]+bankx_dollar_value_d18;
         unclaimedPoolBankX = unclaimedPoolBankX+bankx_dollar_value_d18+current_accum_interest;
         collat_XSD -= XSD_amount;
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         XSD.pool_burn_from(msg.sender, XSD_amount);
         BankX.pool_mint(address(this), bankx_amount);
     }
@@ -343,7 +332,7 @@ contract CollateralPool is ReentrancyGuard {
     function collectRedemption() external nonReentrant{
         require(!pid_controller.bucket3(), "Cannot withdraw in times of deficit");
         require(!redeem_paused, "Redeem Paused");
-        require(((lastRedeemed[msg.sender]+(block_delay)) <= block.number) && ((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before redeeming");
+        require(((lastRedeemed[msg.sender]+(block_delay)) <= block.number) && ((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before redeeming");
         uint BankXDollarAmount;
         uint CollateralDollarAmount;
         uint BankXAmount;
@@ -352,7 +341,7 @@ contract CollateralPool is ReentrancyGuard {
         // Use Checks-Effects-Interactions pattern
         if(redeemBankXBalances[msg.sender] > 0){
             BankXDollarAmount = redeemBankXBalances[msg.sender];
-            BankXAmount = (BankXDollarAmount*1e6)/bankx_price;
+            BankXAmount = (BankXDollarAmount*1e6)/pid_controller.bankx_updated_price();
             redeemBankXBalances[msg.sender] = 0;
             unclaimedPoolBankX = unclaimedPoolBankX-BankXDollarAmount;
             TransferHelper.safeTransfer(address(BankX), msg.sender, BankXAmount);
@@ -363,22 +352,22 @@ contract CollateralPool is ReentrancyGuard {
             CollateralAmount = (CollateralDollarAmount*1e6)/XSD.eth_usd_price();
             redeemCollateralBalances[msg.sender] = 0;
             unclaimedPoolCollateral = unclaimedPoolCollateral-CollateralDollarAmount;
-            IWETH(WETH).withdraw(CollateralAmount); //try to unwrap eth in the redeem
+            IWBNB(WETH).withdraw(CollateralAmount); //try to unwrap eth in the redeem
             TransferHelper.safeTransferETH(msg.sender, CollateralAmount);
         }
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
     }
 
     // Function can be called by an BankX holder to have the protocol buy back BankX with excess collateral value from a desired collateral pool
     // This can also happen if the collateral ratio > 1
     // add XSD as a burn option while uXSD value is positive
     // need two seperate functions: one for bankx and one for XSD
-    function buyBackBankX(uint256 BankX_amount,uint256 COLLATERAL_out_min) external{
+    function buyBackBankX(uint256 BankX_amount,uint256 COLLATERAL_out_min, uint256 deadline) external ensure(deadline){
         require(!buyback_paused, "Buyback Paused");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before buyback");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before buyback");
         CollateralPoolLibrary.BuybackBankX_Params memory input_params = CollateralPoolLibrary.BuybackBankX_Params(
             availableExcessCollatDV(),
-            bankx_price,
+            pid_controller.bankx_updated_price(),
             XSD.eth_usd_price(),
             BankX_amount
         );
@@ -386,22 +375,22 @@ contract CollateralPool is ReentrancyGuard {
         (collateral_equivalent_d18) = (CollateralPoolLibrary.calcBuyBackBankX(input_params));
 
         require(COLLATERAL_out_min <= collateral_equivalent_d18, "Slippage limit reached");
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         // Give the sender their desired collateral and burn the BankX
         BankX.pool_burn_from(msg.sender, BankX_amount);
         TransferHelper.safeTransfer(address(WETH), address(this), collateral_equivalent_d18);
-        IWETH(WETH).withdraw(collateral_equivalent_d18);
+        IWBNB(WETH).withdraw(collateral_equivalent_d18);
         TransferHelper.safeTransferETH(msg.sender, collateral_equivalent_d18);
     }
     //buyback with XSD instead of bankx
-    function buyBackXSD(uint256 XSD_amount, uint256 collateral_out_min) external {
+    function buyBackXSD(uint256 XSD_amount, uint256 collateral_out_min, uint256 deadline) external ensure(deadline){
         require(!buyback_paused, "Buyback Paused");
-        require(((lastPriceCheck[msg.sender].lastpricecheck+(block_delay)) <= block.number) && (lastPriceCheck[msg.sender].pricecheck), "Must wait for block_delay blocks before buyback");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks before buyback");
         if(XSD_amount != 0) require((XSD.totalSupply()+XSD_amount)>collat_XSD, "uXSD MUST BE POSITIVE");
 
         CollateralPoolLibrary.BuybackXSD_Params memory input_params = CollateralPoolLibrary.BuybackXSD_Params(
             availableExcessCollatDV(),
-            xsd_price,
+            pid_controller.xsd_updated_price(),
             XSD.eth_usd_price(),
             XSD_amount
         );
@@ -409,10 +398,10 @@ contract CollateralPool is ReentrancyGuard {
         (collateral_equivalent_d18) = (CollateralPoolLibrary.calcBuyBackXSD(input_params));
 
         require(collateral_out_min <= collateral_equivalent_d18, "Slippage limit reached");
-        lastPriceCheck[msg.sender].pricecheck = false;
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         XSD.pool_burn_from(msg.sender, XSD_amount);
         TransferHelper.safeTransfer(address(WETH), address(this), collateral_equivalent_d18);
-        IWETH(WETH).withdraw(collateral_equivalent_d18);
+        IWBNB(WETH).withdraw(collateral_equivalent_d18);
         TransferHelper.safeTransferETH(msg.sender, collateral_equivalent_d18);
     }
 
@@ -431,7 +420,7 @@ contract CollateralPool is ReentrancyGuard {
     }
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
     }
 

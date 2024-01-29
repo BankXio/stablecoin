@@ -21,6 +21,7 @@ contract XSDWETHpool is IXSDWETHpool, Initializable, ReentrancyGuard{
     address private XSDaddress;
     address private WETHaddress;
     address public smartcontract_owner;
+    address public router_address;
     //keeps track of amount that needs to be burnt
     uint public xsdamount;
 
@@ -36,6 +37,13 @@ contract XSDWETHpool is IXSDWETHpool, Initializable, ReentrancyGuard{
     uint public override price1CumulativeLast;
     uint public override kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity even
 
+    uint private unlocked = 1;
+    modifier lock() {
+        require(unlocked == 1, 'UniswapV2: LOCKED');
+        unlocked = 0;
+        _;
+        unlocked = 1;
+    }
     uint public reserve0_residue;
     uint public reserve1_residue;
 
@@ -87,11 +95,13 @@ contract XSDWETHpool is IXSDWETHpool, Initializable, ReentrancyGuard{
     function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
         require(balance0 <= type(uint112).max && balance1 <= type(uint112).max, 'XSDWETH: OVERFLOW');
         uint32 blockTimestamp = uint32(block.timestamp % 2**32);
-        uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
-        if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
-            // * never overflows, and + overflow is desired
-            price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
-            price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+        unchecked{
+            uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
+            if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
+                // * never overflows, and + overflow is desired
+                price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
+                price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+            }
         }
         reserve0 = uint112(balance0);
         reserve1 = uint112(balance1);
@@ -105,7 +115,9 @@ contract XSDWETHpool is IXSDWETHpool, Initializable, ReentrancyGuard{
     }
 
     // this low-level function should be called from a contract which performs important safety checks
-    function swap(uint amount0Out, uint amount1Out, address to) external override nonReentrant {
+    function swap(uint amount0Out, uint amount1Out, address to) external override lock{
+        //router access only
+        require(msg.sender == router_address, "Only the router can access this function");
         require(amount0Out > 0 || amount1Out > 0, 'XSDWETH: INSUFFICIENT_OUTPUT_AMOUNT');
         (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
         _reserve0 = uint112(_reserve0);
@@ -152,8 +164,13 @@ contract XSDWETHpool is IXSDWETHpool, Initializable, ReentrancyGuard{
 
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
+    }
+
+    function setRouterAddress(address _router_address) external{
+        require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
+        router_address = _router_address;
     }
 
     function renounceOwnership() external{

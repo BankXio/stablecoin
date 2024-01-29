@@ -17,12 +17,14 @@ contract ChainlinkXAGUSDPriceConsumer {
      */
     function getLatestPrice() public view returns (int) {
         (
+            uint80 roundID
             , 
             int price,
             ,
             ,
-            
+            uint80 answeredInRound
         ) = priceFeed.latestRoundData();
+        require(answeredInRound >= roundID);
         return price;
     }
 

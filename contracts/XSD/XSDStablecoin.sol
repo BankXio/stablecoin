@@ -4,7 +4,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/utils/Context.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "../ERC20/ERC20Custom.sol";
+import "../BEP20/BEP20Custom.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "./Pools/CollateralPool.sol";
 import "./Pools/Interfaces/IBankXWETHpool.sol";
@@ -12,7 +12,7 @@ import "./Pools/Interfaces/IXSDWETHpool.sol";
 import "../Oracle/ChainlinkETHUSDPriceConsumer.sol";
 import "../Oracle/ChainlinkXAGUSDPriceConsumer.sol";
 
-contract XSDStablecoin is ERC20Custom {
+contract XSDStablecoin is BEP20Custom {
 
     /* ========== STATE VARIABLES ========== */
     enum PriceChoice { XSD, BankX }
@@ -35,6 +35,9 @@ contract XSDStablecoin is ERC20Custom {
     IXSDWETHpool private xsdEthPool;
     uint256 public cap_rate;
     uint256 public genesis_supply; 
+    //test variables
+    uint256 ethusdprice;
+    uint256 xagusdprice;
 
     // The addresses in this array are added by the oracle and these contracts are able to mint xsd
     address[] public xsd_pools_array;
@@ -110,7 +113,7 @@ contract XSDStablecoin is ERC20Custom {
 
     function pool_price(PriceChoice choice) internal view returns (uint256) {
         // Get the ETH / USD price first, and cut it down to 1e6 precision
-        uint256 _eth_usd_price = (uint256(eth_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** eth_usd_pricer_decimals);
+        uint256 _eth_usd_price = 1200000000;//(uint256(eth_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** eth_usd_pricer_decimals);
         uint256 price_vs_eth = 0;
         uint256 reserve0;
         uint256 reserve1;
@@ -146,11 +149,19 @@ contract XSDStablecoin is ERC20Custom {
     }
 
     function eth_usd_price() public view returns (uint256) {
-        return (uint256(eth_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** eth_usd_pricer_decimals);
+        return ethusdprice;//(uint256(eth_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** eth_usd_pricer_decimals);
     }
     //silver price
+    //hard coded value for testing on goerli
     function xag_usd_price() public view returns (uint256) {
-        return (uint256(xag_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** xag_usd_pricer_decimals);
+        return xagusdprice;//(uint256(xag_usd_pricer.getLatestPrice())*PRICE_PRECISION)/(uint256(10) ** xag_usd_pricer_decimals);
+    }
+    //test functions
+    function setETHUSDPRICE(uint _eth_usd_price) public {
+        ethusdprice = _eth_usd_price;
+    }
+    function setXAGUSDPRICE(uint _xag_usd_price) public {
+        xagusdprice = _xag_usd_price;
     }
 
     
@@ -363,7 +374,7 @@ contract XSDStablecoin is ERC20Custom {
 
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
     }
 

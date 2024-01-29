@@ -2,12 +2,12 @@
 pragma solidity ^0.8.0;
 
 
-import "../ERC20/ERC20Custom.sol";
+import "../BEP20/BEP20Custom.sol";
 import "@openzeppelin/contracts/utils/Context.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "../XSD/XSDStablecoin.sol";
 
-contract BankXToken is ERC20Custom {
+contract BankXToken is BEP20Custom {
 
     /* ========== STATE VARIABLES ========== */
 
@@ -114,7 +114,7 @@ contract BankXToken is ERC20Custom {
 
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
     }
 

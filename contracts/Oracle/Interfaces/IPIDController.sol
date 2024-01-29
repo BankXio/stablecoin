@@ -11,10 +11,14 @@ interface IPIDController{
     function amountpaid1() external view returns (uint);
     function amountpaid2() external view returns (uint);
     function amountpaid3() external view returns (uint);
-    function bankx_arbi_limit() external view returns (uint);
-    function xsd_arbi_limit() external view returns (uint);
-    function bankx_burnable_limit() external view returns (uint);
-    function xsd_burnable_limit() external view returns (uint);
+    function bankx_updated_price() external view returns (uint);
+    function xsd_updated_price() external view returns (uint);
+    function systemCalculations() external;
+    struct PriceCheck{
+        uint256 lastpricecheck;
+        bool pricecheck;
+    }
+    function lastPriceCheck(address user) external view returns (PriceCheck memory info);
     function amountPaidBankXWETH(uint ethvalue) external;
     function amountPaidXSDWETH(uint ethvalue) external;
     function amountPaidCollateralPool(uint ethvalue) external;

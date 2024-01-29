@@ -25,6 +25,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
     uint public vesting1;
     uint public vesting2;
     uint public vesting3;
+    uint public block_delay;
     struct Liquidity_Provider{
         uint vestingtimestamp;
         uint ethvalue;
@@ -42,7 +43,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         weth_address = _weth_address;
     }
     // called once by the smart contract owner at time of deployment
-    function initialize(address _bankx_address, address _xsd_address,address _xsd_pool_address,address _bankx_pool_address,address _collat_pool_address, address _pid_address,uint _vesting1,uint _vesting2,uint _vesting3) public initializer {
+    function initialize(address _bankx_address, address _xsd_address,address _xsd_pool_address,address _bankx_pool_address,address _collat_pool_address, address _pid_address,uint _vesting1,uint _vesting2,uint _vesting3,uint _block_delay) public initializer {
         require(msg.sender == smartcontract_owner, 'RewardManager: FORBIDDEN'); // sufficient check
         require((_bankx_address != address(0))
         &&(_xsd_address != address(0))
@@ -62,6 +63,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         vesting1 = _vesting1;
         vesting2 = _vesting2;
         vesting3 = _vesting3;
+        block_delay = _block_delay;
     }
 
     function tier1(address pool,uint percent,address to,uint ethvalue,uint amountpaid,uint difference) private {
@@ -97,7 +99,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
             liquidity_provider[pool][to][vesting2].xsdrewards += ethvalue/50;
         }
     }
-//When the creator adds liquidity during a deficit period it must be added to the amount paid variables
+
     function creatorProvideBankXLiquidity() external override nonReentrant{
         (uint112 _reserve0, uint112 _reserve1,) = bankxwethpool.getReserves(); // gas savings
         uint balance0 = IERC20(bankx_address).balanceOf(bankx_pool_address);
@@ -105,7 +107,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         uint amount0 = balance0-(_reserve0);
         uint amount1 = balance1-(_reserve1);
         if(pid_controller.bucket2()){
-            uint ethvalue = ((amount0*XSD.bankx_price())+(amount1*XSD.eth_usd_price()))/(1e6);
+            uint ethvalue = ((amount0*pid_controller.bankx_updated_price())+(amount1*XSD.eth_usd_price()))/(1e6);
             pid_controller.amountPaidBankXWETH(ethvalue);
         }
         bankxwethpool.sync();
@@ -119,7 +121,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         uint amount0 = balance0-(_reserve0);
         uint amount1 = balance1-(_reserve1);
         if(pid_controller.bucket1()){
-            uint ethvalue = ((amount0*XSD.xsd_price())+(amount1*XSD.eth_usd_price()))/(1e6);
+            uint ethvalue = ((amount0*pid_controller.xsd_updated_price())+(amount1*XSD.eth_usd_price()))/(1e6);
             pid_controller.amountPaidXSDWETH(ethvalue);
         }
         xsdwethpool.sync();
@@ -128,11 +130,12 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
     //principal is split among tiers as well
     function userProvideBankXLiquidity(address to) external override nonReentrant{
         require(pid_controller.bucket2(), "RewardManager:NO DEFICIT");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks");
         (, uint112 _reserve1,) = bankxwethpool.getReserves(); // gas savings
         uint balance1 = IERC20(weth_address).balanceOf(bankx_pool_address);
         uint amount = balance1-_reserve1;
         uint ethvalue = (amount*(XSD.eth_usd_price()))/(1e6);
-        uint bankxamount = ethvalue/XSD.bankx_price();
+        uint bankxamount = ethvalue/pid_controller.bankx_updated_price();
         uint amountpaid = pid_controller.amountpaid2();
         uint difference = pid_controller.diff2()/3;
         require((ethvalue+amountpaid)<(difference*3),"BankXLiquidity:DEFICIT LIMIT");
@@ -152,16 +155,18 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         BankX.pool_mint(bankx_pool_address, bankxamount);
         pid_controller.amountPaidBankXWETH(ethvalue);
         bankxwethpool.sync();
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         emit UserProvideBankXLiquidity(to, amount);
     }
 
     function userProvideXSDLiquidity(address to) external override nonReentrant{
         require(pid_controller.bucket1(),"RewardManager:NO DEFICIT");
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks");
         (, uint112 _reserve1,) = xsdwethpool.getReserves(); // gas savings
         uint balance1 = IERC20(weth_address).balanceOf(xsd_pool_address);
         uint amount = balance1-_reserve1;
         uint ethvalue = (amount*(XSD.eth_usd_price()))/(1e6);
-        uint xsdamount = ethvalue/XSD.xsd_price();
+        uint xsdamount = ethvalue/pid_controller.xsd_updated_price();
         uint amountpaid = pid_controller.amountpaid1();
         uint difference = pid_controller.diff1()/3;
         require((ethvalue+amountpaid)<(difference*3),"XSDLiquidity:DEFICIT LIMIT");
@@ -181,6 +186,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         XSD.pool_mint(xsd_pool_address, xsdamount);
         pid_controller.amountPaidXSDWETH(ethvalue);
         xsdwethpool.sync();
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         emit UserProvideXSDLiquidity(to, amount);
     }
 
@@ -210,8 +216,8 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
 
     function tier1Redemption(address pool,address to) private returns(uint bankxamount,uint xsdamount){
         require(liquidity_provider[pool][to][vesting1].bankxrewards != 0 || liquidity_provider[pool][to][vesting1].xsdrewards != 0, "Nothing to claim");
-        bankxamount = ((liquidity_provider[pool][to][vesting1].bankxrewards)*(1e6))/(XSD.bankx_price());
-        xsdamount = ((liquidity_provider[pool][to][vesting1].xsdrewards)*(1e6))/(XSD.xsd_price());
+        bankxamount = ((liquidity_provider[pool][to][vesting1].bankxrewards)*(1e6))/(pid_controller.bankx_updated_price());
+        xsdamount = ((liquidity_provider[pool][to][vesting1].xsdrewards)*(1e6))/(pid_controller.xsd_updated_price());
         liquidity_provider[pool][to][vesting1].bankxrewards = 0;
         liquidity_provider[pool][to][vesting1].xsdrewards = 0;
         liquidity_provider[pool][to][vesting1].ethvalue = 0;
@@ -219,8 +225,8 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
     }
     function tier2Redemption(address pool,address to) private returns(uint bankxamount,uint xsdamount){
         require(liquidity_provider[pool][to][vesting2].bankxrewards != 0 || liquidity_provider[pool][to][vesting2].xsdrewards != 0, "Nothing to claim");
-        bankxamount = ((liquidity_provider[pool][to][vesting2].bankxrewards)*(1e6))/(XSD.bankx_price());
-        xsdamount = ((liquidity_provider[pool][to][vesting2].xsdrewards)*(1e6))/(XSD.xsd_price());
+        bankxamount = ((liquidity_provider[pool][to][vesting2].bankxrewards)*(1e6))/(pid_controller.bankx_updated_price());
+        xsdamount = ((liquidity_provider[pool][to][vesting2].xsdrewards)*(1e6))/(pid_controller.xsd_updated_price());
         liquidity_provider[pool][to][vesting2].bankxrewards = 0;
         liquidity_provider[pool][to][vesting2].xsdrewards = 0;
         liquidity_provider[pool][to][vesting2].ethvalue = 0;
@@ -228,14 +234,14 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
     }
     function tier3Redemption(address pool,address to) private returns(uint bankxamount){
         require(liquidity_provider[pool][to][vesting3].bankxrewards != 0, "RewardManager:NO CLAIM");
-        bankxamount = ((liquidity_provider[pool][to][vesting3].bankxrewards)*(1e6))/(XSD.bankx_price());
+        bankxamount = ((liquidity_provider[pool][to][vesting3].bankxrewards)*(1e6))/(pid_controller.bankx_updated_price());
         liquidity_provider[pool][to][vesting3].bankxrewards = 0;
         liquidity_provider[pool][to][vesting3].ethvalue = 0;
         liquidity_provider[pool][to][vesting3].vestingtimestamp = 0;
     }
 
     function LiquidityRedemption(address pool,address to) external override nonReentrant{
-        //find a better way to check which tier
+        require(((pid_controller.lastPriceCheck(msg.sender).lastpricecheck+(block_delay)) <= block.number) && (pid_controller.lastPriceCheck(msg.sender).pricecheck), "Must wait for block_delay blocks");
         uint bankxamount;
         uint xsdamount;
         if((liquidity_provider[pool][to][vesting1].ethvalue != 0) && (liquidity_provider[pool][to][vesting1].vestingtimestamp<=block.timestamp)){
@@ -251,13 +257,14 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         if((liquidity_provider[pool][to][vesting3].ethvalue != 0) && (liquidity_provider[pool][to][vesting3].vestingtimestamp<=block.timestamp)){
             bankxamount += tier3Redemption(pool,to);
         }
+        pid_controller.lastPriceCheck(msg.sender).pricecheck = false;
         BankX.pool_mint(to, bankxamount);
         XSD.pool_mint(to, xsdamount);
         emit liquidityRedemption(to, bankxamount, xsdamount);
     }
     function setSmartContractOwner(address _smartcontract_owner) external{
         require(msg.sender == smartcontract_owner, "Only the smart contract owner can access this function");
-        require(msg.sender != address(0), "Zero address detected");
+        require(_smartcontract_owner != address(0), "Zero address detected");
         smartcontract_owner = _smartcontract_owner;
     }
 
@@ -266,7 +273,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         smartcontract_owner = address(0);
     }
 
-    function resetAddresses(address _bankx_address, address _xsd_address,address _xsd_pool_address,address _bankx_pool_address,address _collat_pool_address, address _pid_address,uint _vesting1,uint _vesting2,uint _vesting3) external{
+    function resetAddresses(address _bankx_address, address _xsd_address,address _xsd_pool_address,address _bankx_pool_address,address _collat_pool_address, address _pid_address,uint _vesting1,uint _vesting2,uint _vesting3, uint _block_delay) external{
         require(msg.sender == smartcontract_owner, 'RewardManager: FORBIDDEN'); // sufficient check
         require((_bankx_address != address(0))
         &&(_xsd_address != address(0))
@@ -286,6 +293,7 @@ contract RewardManager is IRewardManager,ReentrancyGuard,Initializable{
         vesting1 = _vesting1;
         vesting2 = _vesting2;
         vesting3 = _vesting3;
+        block_delay = _block_delay;
     }
     // ========== EVENTS ========== 
     event CreatorProvideBankXLiquidity(address sender, uint amount0, uint amount1);
